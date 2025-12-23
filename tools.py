@@ -20,9 +20,8 @@ class ToolRunner:
     def call(self, name: str, params: dict) -> str:
         entry = self._dispatch.get(name)
         if entry is None: return f"Unknown tool: {name}"
-        args_model, func_obj = entry
+        args_model, func = entry
         args = args_model.model_validate(params).model_dump()
-        func = func_obj
         result = func(**args)  # type: ignore[misc]
         return str(result)
     
