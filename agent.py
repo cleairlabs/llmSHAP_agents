@@ -1,95 +1,71 @@
 import gc, os
-from llmSHAP.generation import Generation
-from pydantic import BaseModel
 import json
-import inspect
 import re
-
 from openai import OpenAI
 from dotenv import load_dotenv
-
 from llmSHAP import DataHandler, BasicPromptCodec, ShapleyAttribution, ValueFunction
 from llmSHAP.llm.llm_interface import LLMInterface
+from llmSHAP.generation import Generation
 from llmSHAP.types import Prompt, Optional
+from tools import ToolRunner, build_openai_tool_registry
 
 
-
-class MultiplyArgs(BaseModel):
-    num1: int
-    num2: int
-
-class WeatherArgs(BaseModel):
-    city: str
-
-class ToolCall(BaseModel):
-    tool_name: str
-    parameters: dict
 
 class Agent(LLMInterface):
-    def __init__(self,
-                 model_name: str,
-                 tool_registry: dict[str, dict],
-                 temperature: float = 0.2,
-                 max_tokens: int = 512,
-                 seed: Optional[int] = None):
+    def __init__(
+        self,
+        model_name: str,
+        tool_registry: dict[str, dict],
+        temperature: float = 0.2,
+        max_tokens: int = 512,
+        seed: Optional[int] = None,
+        tool_runner: ToolRunner | None = None,
+    ):
         load_dotenv()
         api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key: raise RuntimeError("OPENAI_API_KEY is not set. Set it (e.g. in your .env).")
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY is not set. Set it (e.g. in your .env).")
+
         self.client: OpenAI = OpenAI(api_key=api_key)
         self.model_name = model_name
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.seed = seed
         self.tool_registry = tool_registry
+        self.tool_runner = tool_runner or ToolRunner()
 
     def is_local(self): return False
     def name(self): return self.model_name
     def cleanup(self): gc.collect()
 
+
     def generate(self, prompt: Prompt) -> str:
         messages = list(prompt)
-        message = self._call_llm(messages).choices[0].message # type: ignore
+        message = self._call_llm(messages).choices[0].message  # type: ignore
         while message.tool_calls:
             messages = self._append_tool_call_message(messages, message)
             for tool_call in message.tool_calls:
                 name, params = self._extract_tool_call(tool_call)
                 result = self._call_tool(name, params)
                 messages = self._append_tool_result_message(messages, tool_call, result)
-            message = self._call_llm(messages).choices[0].message # type: ignore
+            message = self._call_llm(messages).choices[0].message  # type: ignore
         return message.content or ""
-    
-    ### TOOLS ###
-    def _tool_multiply_two_numbers(self, num1: int, num2: int) -> int:
-        print(f"[CALLED] {inspect.currentframe().f_code.co_name}") # type: ignore
-        return num1*num2
-    
-    def _tool_get_weather(self, city: str) -> str:
-        print(f"[CALLED] {inspect.currentframe().f_code.co_name}") # type: ignore
-        return "22 C and sunny"
-    ### ### ###
+
 
     def _append_tool_result_message(self, messages, tool_call, result):
-        messages.append({
-            "role": "tool",
-            "tool_call_id": tool_call.id,
-            "content": str(result),
-        })
+        messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": str(result)})
         return messages
 
-    def _call_tool(self, name, params):
-        result: str = f"Unknown tool: {name}"
-        if name == "multiply_two_numbers":
-            arguments = MultiplyArgs.model_validate(params)
-            result = str(self._tool_multiply_two_numbers(arguments.num1, arguments.num2))
-        elif name == "get_weather":
-            arguments = WeatherArgs.model_validate(params)
-            result = self._tool_get_weather(arguments.city)
-        return result
+
+    def _call_tool(self, name: str, params: dict) -> str:
+        return self.tool_runner.call(name, params)
+
 
     def _extract_tool_call(self, tool_call):
         name = tool_call.function.name
         params = json.loads(tool_call.function.arguments or "{}")
         return name, params
+
 
     def _append_tool_call_message(self, messages, message):
         messages.append({
@@ -99,16 +75,14 @@ class Agent(LLMInterface):
                 {
                     "id": tool_call.id,
                     "type": "function",
-                    "function": {
-                        "name": tool_call.function.name,
-                        "arguments": tool_call.function.arguments,
-                    },
+                    "function": {"name": tool_call.function.name, "arguments": tool_call.function.arguments},
                 }
                 for tool_call in message.tool_calls
-            ], # type: ignore
+            ],
         })
         return messages
-    
+
+
     def _extract_enabled_tool_names(self, messages_in: list[dict]) -> list[str]:
         enabled: list[str] = []
         pattern = re.compile(r"\[TOOL\s+([^\]]+)\]")
@@ -117,6 +91,7 @@ class Agent(LLMInterface):
             content = message.get("content", "")
             if not isinstance(content, str): continue
             enabled.extend(pattern.findall(content))
+
         seen: set[str] = set()
         ordered: list[str] = []
         for name in enabled:
@@ -124,6 +99,7 @@ class Agent(LLMInterface):
                 seen.add(name)
                 ordered.append(name)
         return ordered
+
 
     def _strip_tool_markers(self, messages_in: list[dict]) -> list[dict]:
         pattern = re.compile(r"\s*\[TOOL\s+[^\]]+\]\s*")
@@ -133,6 +109,7 @@ class Agent(LLMInterface):
                 cleaned.append({**message, "content": pattern.sub(" ", message["content"]).strip()})
             else: cleaned.append(message)
         return cleaned
+
 
     def _call_llm(self, messages_in: list[dict]) -> object:
         enabled_names = self._extract_enabled_tool_names(messages_in)
@@ -171,35 +148,6 @@ class DiffValue(ValueFunction):
     def __init__(self) -> None: pass
     def __call__(self, base_generation: Generation, coalition_generation: Generation) -> float:
         return abs(int(coalition_generation.output) - 275268)
-
-
-def build_openai_tool_registry() -> dict[str, dict]:
-    mult_schema = MultiplyArgs.model_json_schema()
-    mult_schema["additionalProperties"] = False
-    mult_schema["required"] = ["num1", "num2"]
-
-    weather_schema = WeatherArgs.model_json_schema()
-    weather_schema["additionalProperties"] = False
-    weather_schema["required"] = ["city"]
-
-    return {
-        "multiply_two_numbers": {
-            "type": "function",
-            "function": {
-                "name": "multiply_two_numbers",
-                "parameters": mult_schema,
-                "strict": True,
-            },
-        },
-        "get_weather": {
-            "type": "function",
-            "function": {
-                "name": "get_weather",
-                "parameters": weather_schema,
-                "strict": True,
-            },
-        },
-    }
 
 
 data = {
