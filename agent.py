@@ -5,15 +5,12 @@ import json
 import inspect
 import re
 
-from llmSHAP import DataHandler, BasicPromptCodec, ShapleyAttribution, ValueFunction
-from llmSHAP.llm.llm_interface import LLMInterface
-from llmSHAP.types import Prompt, Optional
-
-
 from openai import OpenAI
 from dotenv import load_dotenv
 
-
+from llmSHAP import DataHandler, BasicPromptCodec, ShapleyAttribution, ValueFunction
+from llmSHAP.llm.llm_interface import LLMInterface
+from llmSHAP.types import Prompt, Optional
 
 
 
@@ -27,7 +24,6 @@ class WeatherArgs(BaseModel):
 class ToolCall(BaseModel):
     tool_name: str
     parameters: dict
-
 
 class Agent(LLMInterface):
     def __init__(self,
@@ -52,58 +48,74 @@ class Agent(LLMInterface):
 
     def generate(self, prompt: Prompt) -> str:
         messages = list(prompt)
-
         message = self._call_llm(messages).choices[0].message # type: ignore
         while message.tool_calls:
-            messages.append({
-                "role": "assistant",
-                "content": message.content,
-                "tool_calls": [
-                    {
-                        "id": tool_call.id,
-                        "type": "function",
-                        "function": {
-                            "name": tool_call.function.name,
-                            "arguments": tool_call.function.arguments,
-                        },
-                    }
-                    for tool_call in message.tool_calls
-                ], # type: ignore
-            })
+            messages = self._append_tool_call_message(messages, message)
             for tool_call in message.tool_calls:
-                name = tool_call.function.name
-                params = json.loads(tool_call.function.arguments or "{}")
-                result: str = f"Unknown tool: {name}"
-                if name == "multiply_two_numbers":
-                    arguments = MultiplyArgs.model_validate(params)
-                    result = str(self._tool_multiply_two_numbers(arguments.num1, arguments.num2))
-                elif name == "get_weather":
-                    arguments = WeatherArgs.model_validate(params)
-                    result = self._tool_get_weather(arguments.city)
-
-                return result
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": str(result),
-                })
-
+                name, params = self._extract_tool_call(tool_call)
+                result = self._call_tool(name, params)
+                messages = self._append_tool_result_message(messages, tool_call, result)
             message = self._call_llm(messages).choices[0].message # type: ignore
-
-
-        print(f"\n\nRETURN: {message.content or ''}")
         return message.content or ""
     
+    ### TOOLS ###
+    def _tool_multiply_two_numbers(self, num1: int, num2: int) -> int:
+        print(f"[CALLED] {inspect.currentframe().f_code.co_name}") # type: ignore
+        return num1*num2
+    
+    def _tool_get_weather(self, city: str) -> str:
+        print(f"[CALLED] {inspect.currentframe().f_code.co_name}") # type: ignore
+        return "22 C and sunny"
+    ### ### ###
 
+    def _append_tool_result_message(self, messages, tool_call, result):
+        messages.append({
+            "role": "tool",
+            "tool_call_id": tool_call.id,
+            "content": str(result),
+        })
+        return messages
+
+    def _call_tool(self, name, params):
+        result: str = f"Unknown tool: {name}"
+        if name == "multiply_two_numbers":
+            arguments = MultiplyArgs.model_validate(params)
+            result = str(self._tool_multiply_two_numbers(arguments.num1, arguments.num2))
+        elif name == "get_weather":
+            arguments = WeatherArgs.model_validate(params)
+            result = self._tool_get_weather(arguments.city)
+        return result
+
+    def _extract_tool_call(self, tool_call):
+        name = tool_call.function.name
+        params = json.loads(tool_call.function.arguments or "{}")
+        return name, params
+
+    def _append_tool_call_message(self, messages, message):
+        messages.append({
+            "role": "assistant",
+            "content": message.content,
+            "tool_calls": [
+                {
+                    "id": tool_call.id,
+                    "type": "function",
+                    "function": {
+                        "name": tool_call.function.name,
+                        "arguments": tool_call.function.arguments,
+                    },
+                }
+                for tool_call in message.tool_calls
+            ], # type: ignore
+        })
+        return messages
+    
     def _extract_enabled_tool_names(self, messages_in: list[dict]) -> list[str]:
         enabled: list[str] = []
         pattern = re.compile(r"\[TOOL\s+([^\]]+)\]")
-        for m in messages_in:
-            if m.get("role") != "user":
-                continue
-            content = m.get("content", "")
-            if not isinstance(content, str):
-                continue
+        for message in messages_in:
+            if message.get("role") != "user": continue
+            content = message.get("content", "")
+            if not isinstance(content, str): continue
             enabled.extend(pattern.findall(content))
         seen: set[str] = set()
         ordered: list[str] = []
@@ -116,18 +128,16 @@ class Agent(LLMInterface):
     def _strip_tool_markers(self, messages_in: list[dict]) -> list[dict]:
         pattern = re.compile(r"\s*\[TOOL\s+[^\]]+\]\s*")
         cleaned: list[dict] = []
-        for m in messages_in:
-            if m.get("role") == "user" and isinstance(m.get("content"), str):
-                cleaned.append({**m, "content": pattern.sub(" ", m["content"]).strip()})
-            else:
-                cleaned.append(m)
+        for message in messages_in:
+            if message.get("role") == "user" and isinstance(message.get("content"), str):
+                cleaned.append({**message, "content": pattern.sub(" ", message["content"]).strip()})
+            else: cleaned.append(message)
         return cleaned
 
     def _call_llm(self, messages_in: list[dict]) -> object:
         enabled_names = self._extract_enabled_tool_names(messages_in)
         tools = [self.tool_registry[name] for name in enabled_names]
         messages = self._strip_tool_markers(messages_in)
-
         kwargs: dict = dict(
             model=self.model_name,
             messages=messages,
@@ -136,21 +146,10 @@ class Agent(LLMInterface):
         )
         if self.seed is not None:
             kwargs["seed"] = self.seed
-
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
-
         return self.client.chat.completions.create(**kwargs)  # type: ignore[arg-type]
-    
-    ### TOOLS ###
-    def _tool_multiply_two_numbers(self, num1: int, num2: int) -> int:
-        print(f"[CALLED] {inspect.currentframe().f_code.co_name}") # type: ignore
-        return num1*num2
-    
-    def _tool_get_weather(self, city: str) -> str:
-        print(f"[CALLED] {inspect.currentframe().f_code.co_name}") # type: ignore
-        return "22 C and sunny"
 
 
 

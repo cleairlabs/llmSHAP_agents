@@ -1,4 +1,6 @@
 # llmSHAP Agents
+Agents based on [llmSHAP](https://github.com/filipnaudot/llmSHAP).
+
 
 - [X] Tool-based agent (most important tool)
 - [ ] RAG-based agent (most important retrieved document)
